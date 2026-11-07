@@ -36,6 +36,6 @@ It never clicks or sends input to the game.
 7. Right-click any legend in the grid to exclude/include it from the random pool.
 
 ## Notes
-- Slot 0 (Random) is ignored.
+- Slot 0 (Random) is ignored.(pin random with pressing on button 1)
 - State is saved in `brawl_state.json`. Delete it for a hard reset.
 - Excluded legends are saved separately and can be bulk-cleared in Settings.
