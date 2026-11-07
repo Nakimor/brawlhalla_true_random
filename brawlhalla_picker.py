@@ -24,9 +24,9 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 try:
-    from PIL import Image, ImageOps
+    from PIL import Image, ImageOps, ImageGrab, ImageStat
 except ImportError:
-    Image = ImageOps = None
+    Image = ImageOps = ImageGrab = ImageStat = None
 
 # Make Tk use real pixels on scaled (125% / 150%) displays so the overlay lines up.
 try:
@@ -44,16 +44,21 @@ THUMB_DIR = APP_DIR / "thumbs"
 # Grid measured on a 1366x768 screenshot; scaled to your actual screen.
 DEFAULT_GRID = {"left": 228, "top": 118, "right": 1155, "bottom": 333,
                 "cols": 18, "rows": 4, "legends": 63, "base_w": 1366, "base_h": 768}
-DEFAULT_HOTKEYS = {"show": "f6", "pick": "f7", "hide": "f8", "undo": "f9", "reset": "f10"}
-DEFAULT_OPTS = {"auto_hide": 0, "auto_reset": False}
+DEFAULT_HOTKEYS = {"show": "f6", "pick": "f7", "hide": "f8", "undo": "f9", "reset": "f10", "scan": "f5", "skip": "f4"}
+# tag_color = colour of the blue "P1" cursor tag (measured from a screenshot)
+DEFAULT_OPTS = {"auto_hide": 0, "auto_reset": False, "scan": True, "auto_legends": True,
+                "tag_color": [32, 181, 239], "tag_tol": 30}
 HK_LABELS = {"show": "Show overlay", "pick": "Pick next legend", "hide": "Hide overlay",
-             "undo": "Undo last pick", "reset": "Reset all (press twice)"}
+             "undo": "Undo last pick", "reset": "Reset all (press twice)",
+             "scan": "Find my cursor", "skip": "Skip this pick"}
 
 # ---- Light pink palette ---------------------------------------------------- #
 BG, PANEL, PANEL2, GRID_BG = "#fde8f0", "#fff7fa", "#f9dbe7", "#fde9f1"
 EDGE, FG, MUTED = "#f1b9cf", "#4a2335", "#a77b90"
 HOT, HOT2, ROSE_D, PLUM = "#ff4f9a", "#ff9ac4", "#d63a78", "#3a1626"
 KEY = "#010101"  # overlay transparency key
+FADE_MAX = 0.75  # how far the blinking tag may fade toward white and still count
+SCAN_SECONDS = 1.3  # the P1 tag blinks (~1 s cycle), so scan a little longer than one cycle
 
 
 def mix(c1, c2, t):
@@ -236,6 +241,7 @@ class Store:
         self.opts = dict(DEFAULT_OPTS)
         self.played, self.history = set(), []
         self.last = None  # final legend of the previous cycle
+        self.excluded = set()  # legends you never want picked
         self._load()
 
     def _load(self):
@@ -249,20 +255,27 @@ class Store:
         self.played = set(d.get("played", []))
         self.history = list(d.get("history", []))
         self.last = d.get("last")
+        self.excluded = set(d.get("excluded", []))
 
     def save(self):
         tmp = DATA_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps({"grid": self.grid, "hotkeys": self.hotkeys,
                                    "opts": self.opts, "played": sorted(self.played),
-                                   "history": self.history, "last": self.last}, indent=2), "utf-8")
+                                   "history": self.history, "last": self.last,
+                                   "excluded": sorted(self.excluded)}, indent=2), "utf-8")
         os.replace(tmp, DATA_FILE)
 
     @property
     def legends(self):
         return self.grid["legends"]
 
+    @property
+    def active(self):
+        """Legends that take part in the rotation (everything except the excluded ones)."""
+        return self.legends - len([i for i in self.excluded if i < self.legends])
+
     def unplayed(self):
-        return [i for i in range(self.legends) if i not in self.played]
+        return [i for i in range(self.legends) if i not in self.played and i not in self.excluded]
 
     def mark(self, i):
         self.played.add(i)
@@ -315,7 +328,7 @@ class Overlay:
         self.cv = tk.Canvas(self.win, bg=KEY, highlightthickness=0)
         self.cv.pack(fill="both", expand=True)
         self.visible = self.align = False
-        self.highlight, self.message = None, ""
+        self.highlight, self.message, self.origin = None, "", None
         self._hide_job, self._t, self._hl = None, 0, None
         self.win.update_idletasks()
         self._click_through()
@@ -332,8 +345,8 @@ class Overlay:
             pass
 
     # -- visibility
-    def show(self, message="", highlight=None):
-        self.message, self.highlight = message, highlight
+    def show(self, message="", highlight=None, origin=None):
+        self.message, self.highlight, self.origin = message, highlight, origin
         self.visible = True
         self.win.deiconify()
         self.win.attributes("-topmost", True)
@@ -364,22 +377,27 @@ class Overlay:
             x0, y0, x1, y1 = x0 + 1, y0 + 1, x1 - 1, y1 - 1
             if self.align:
                 cv.create_rectangle(x0, y0, x1, y1, outline=HOT, width=2)
-            played = i in st.played
+            played, excl = i in st.played, i in st.excluded
             if spot is not None and i != spot:
                 cv.create_rectangle(x0, y0, x1, y1, fill=PLUM, stipple="gray50", outline="")
-            elif spot is None and played:
-                cv.create_rectangle(x0, y0, x1, y1, fill=PLUM, stipple="gray25", outline="")
+            elif spot is None and (played or excl):
+                cv.create_rectangle(x0, y0, x1, y1, fill=PLUM, stipple="gray50" if excl else "gray25", outline="")
             if i != spot:
-                self._badge(x1, y1, x1 - x0, played)
+                self._badge(x1, y1, x1 - x0, "excluded" if excl else "played" if played else "unplayed")
+        self._route(spot)
         if spot is not None:
             self._spotlight(*st.rect(spot, self.sw, self.sh))
-        self._pill(self.message or f"{len(st.unplayed())} of {st.legends} unplayed")
+        self._pill(self.message or f"{len(st.unplayed())} of {st.active} unplayed")
 
-    def _badge(self, x1, y1, w, played):
+    def _badge(self, x1, y1, w, state):
         cv = self.cv
         r = max(6, w * 0.15)
         cx, cy = x1 - r - 3, y1 - r - 3
-        if played:
+        if state == "excluded":
+            cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill="#6b5560", outline="white", width=2)
+            cv.create_text(cx, cy - 1, text="⊘", fill="white",
+                           font=("Segoe UI Symbol", max(7, int(r)), "bold"))
+        elif state == "played":
             cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=PLUM, outline="white", width=2)
             cv.create_text(cx, cy - 1, text="✓", fill="white",
                            font=("Segoe UI Symbol", max(7, int(r)), "bold"))
@@ -388,6 +406,31 @@ class Overlay:
             cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=HOT, outline="white", width=2)
             k = r * 0.28
             cv.create_oval(cx - k, cy - k, cx + k, cy + k, fill="white", outline="")
+
+    def _route(self, target):
+        """Ring on the tile your cursor is on, plus an arrow from there to the pick."""
+        if self.origin is None:
+            return
+        cv, st = self.cv, self.st
+        ox0, oy0, ox1, oy1 = st.rect(self.origin - 1, self.sw, self.sh)  # slot s -> legend s-1
+        for col, w in ((PLUM, 8), ("#20b5ef", 4)):
+            cv.create_polygon(rr(ox0 - 2, oy0 - 2, ox1 + 2, oy1 + 2, 8), smooth=True, fill="",
+                              outline=col, width=w)
+        font = ("Segoe UI Semibold", 10)
+        cv.create_text((ox0 + ox1) / 2 + 1, oy0 - 9, text="YOU", fill=PLUM, font=font)
+        cv.create_text((ox0 + ox1) / 2, oy0 - 10, text="YOU", fill="white", font=font)
+        if target is None or self.origin == target + 1:
+            return
+        tx0, ty0, tx1, ty1 = st.rect(target, self.sw, self.sh)
+        ax, ay = (ox0 + ox1) / 2, (oy0 + oy1) / 2
+        bx, by = (tx0 + tx1) / 2, (ty0 + ty1) / 2
+        length = math.hypot(bx - ax, by - ay)
+        if length > 60:  # stop short so the arrowhead points at the tile, not through it
+            bx, by = bx - (bx - ax) / length * 30, by - (by - ay) / length * 30
+        shape = (18, 22, 9)
+        cv.create_line(ax, ay, bx, by, fill=PLUM, width=11, arrow="last", arrowshape=shape, capstyle="round")
+        cv.create_line(ax, ay, bx, by, fill=HOT, width=6, dash=(12, 7), arrow="last",
+                       arrowshape=shape, tags="route")
 
     def _spotlight(self, x0, y0, x1, y1):
         cv = self.cv
@@ -436,6 +479,7 @@ class Overlay:
             a = (self._t // 7) % 2 == 0
             cv.itemconfigure("spark_a", state="normal" if a else "hidden")
             cv.itemconfigure("spark_b", state="hidden" if a else "normal")
+            cv.itemconfigure("route", dashoffset=-self._t * 2)
         self.root.after(45, self._animate)
 
 
@@ -449,7 +493,7 @@ class App:
         self.root.title("Brawlhalla Picker")
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
-        self.root.minsize(620, 300)
+        self.root.minsize(620, 100)
         self.q = queue.Queue()
         self.thumbs, self.thumbs_played = {}, {}
         self.hotkeys = HotkeyManager()
@@ -459,6 +503,8 @@ class App:
         self.ov = Overlay(self.root, self.st)
         self._armed = 0.0
         self._cal_job = None
+        self._scanning = False
+        self._skipped, self._news = set(), ""
         self._stats = (0, 1)
         self._style()
         self._build()
@@ -533,10 +579,11 @@ class App:
         self.gcv = tk.Canvas(frame, bg=GRID_BG, highlightthickness=0, cursor="hand2")
         self.gcv.pack()
         self.gcv.bind("<Button-1>", self._on_click)
+        self.gcv.bind("<Button-3>", self._on_rclick)
         self.gcv.bind("<Motion>", self._on_hover)
         self.gcv.bind("<Leave>", self._on_leave)
 
-        self._default_hint = "Click a portrait to toggle played / unplayed   ·   pink ring = still to play"
+        self._default_hint = "Click = played / unplayed   ·   right-click = exclude a legend   ·   pink ring = still to play"
         self.hint = ttk.Label(p, text=self._default_hint, style="CardMuted.TLabel")
         self.hint.pack(anchor="w", pady=(8, 4))
 
@@ -546,8 +593,9 @@ class App:
         bar = ttk.Frame(p, style="Card.TFrame")
         bar.pack(fill="x")
         ttk.Button(bar, text="✦  Pick random", style="Accent.TButton", command=self.pick).pack(side="left")
-        ttk.Button(bar, text="Undo last", command=self.undo).pack(side="left", padx=6)
-        ttk.Button(bar, text="Reset cycle", command=self.reset_confirm).pack(side="left")
+        ttk.Button(bar, text="Skip pick", command=self.skip).pack(side="left", padx=6)
+        ttk.Button(bar, text="Undo last", command=self.undo).pack(side="left")
+        ttk.Button(bar, text="Reset cycle", command=self.reset_confirm).pack(side="left", padx=6)
         ttk.Button(bar, text="Hide overlay", command=self.ov.hide).pack(side="right")
         ttk.Button(bar, text="Show overlay", command=lambda: self.ov.show()).pack(side="right", padx=6)
 
@@ -571,8 +619,23 @@ class App:
         ttk.Checkbutton(p, text="Start a new cycle automatically when everyone has been played",
                         variable=self.v_auto, command=self._save_opts).grid(
             row=r + 2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.v_scan = tk.BooleanVar(value=self.st.opts["scan"])
+        ttk.Checkbutton(p, text="Find my cursor on pick and show the route (one screenshot, sends nothing)",
+                        variable=self.v_scan, command=self._save_opts).grid(
+            row=r + 3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(p, text="Cursor colour tolerance", style="Card.TLabel").grid(
+            row=r + 4, column=0, sticky="w", pady=(6, 0))
+        self.v_tol = tk.IntVar(value=self.st.opts["tag_tol"])
+        ttk.Spinbox(p, from_=5, to=80, width=6, textvariable=self.v_tol,
+                    command=self._save_opts).grid(row=r + 4, column=1, sticky="w", padx=10, pady=(6, 0))
+        self.v_tol.trace_add("write", lambda *_: self._save_opts())
 
-        r += 4
+        self.v_newleg = tk.BooleanVar(value=self.st.opts["auto_legends"])
+        ttk.Checkbutton(p, text="Detect new legends automatically (adds them when the select screen shows more portraits)",
+                        variable=self.v_newleg, command=self._save_opts).grid(
+            row=r + 5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        r += 7
         ttk.Label(p, text="Grid calibration (1366x768 reference pixels)", style="H.TLabel").grid(
             row=r, column=0, columnspan=3, sticky="w", pady=(18, 4))
         box = ttk.Frame(p, style="Card.TFrame")
@@ -594,6 +657,7 @@ class App:
         data.grid(row=r + 3, column=0, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Button(data, text="Export backup…", command=self.export_state).pack(side="left")
         ttk.Button(data, text="Import backup…", command=self.import_state).pack(side="left", padx=6)
+        ttk.Button(data, text="Clear exclusions", command=self.clear_excluded).pack(side="left")
         self.refresh_hotkey_labels()
 
     # ------------------------------------------------------------ rendering
@@ -699,18 +763,23 @@ class App:
             if i >= st.legends:
                 cv.create_rectangle(x, y, x1, y1, outline=EDGE, dash=(2, 3))
                 continue
-            played = i in st.played
-            img = (self.thumbs_played.get(i) if played else None) or self.thumbs.get(i)
+            played, excl = i in st.played, i in st.excluded
+            img = (self.thumbs_played.get(i) if (played or excl) else None) or self.thumbs.get(i)
             if img:
                 cv.create_image(x, y, image=img, anchor="nw")
             else:
                 cv.create_rectangle(x, y, x1, y1, fill=PANEL2, outline="")
                 cv.create_text((x + x1) / 2, (y + y1) / 2, text=str(i + 1), fill=MUTED, font=("Segoe UI", 9))
-            if played and i not in self.thumbs_played:  # no Pillow: fall back to a pink veil
+            if (played or excl) and i not in self.thumbs_played:  # no Pillow: fall back to a pink veil
                 cv.create_rectangle(x, y, x1, y1, fill="#fde0eb", stipple="gray50", outline="")
-            cv.create_rectangle(x, y, x1, y1, outline=EDGE if played else HOT, width=1 if played else 2)
+            muted = played or excl
+            cv.create_rectangle(x, y, x1, y1, outline=EDGE if muted else HOT, width=1 if muted else 2)
             cx, cy = x1 - 8, y1 - 8
-            if played:
+            if excl:
+                cv.create_rectangle(x, y, x1, y1, fill=PLUM, stipple="gray50", outline="")
+                cv.create_oval(cx - 6, cy - 6, cx + 6, cy + 6, fill="#6b5560", outline="white", width=2)
+                cv.create_text(cx, cy - 1, text="⊘", fill="white", font=("Segoe UI Symbol", 8, "bold"))
+            elif played:
                 cv.create_oval(cx - 6, cy - 6, cx + 6, cy + 6, fill="white", outline=EDGE)
                 cv.create_text(cx, cy - 1, text="✓", fill=ROSE_D, font=("Segoe UI Symbol", 8, "bold"))
             else:
@@ -719,7 +788,7 @@ class App:
                 cv.create_rectangle(x - 1, y - 1, x1 + 1, y1 + 1, outline=PLUM, width=2)
                 cv.create_oval(x + 1, y + 1, x + 15, y + 15, fill=HOT, outline="white", width=1)
                 cv.create_text(x + 8, y + 8, text="✦", fill="white", font=("Segoe UI Symbol", 8, "bold"))
-        self._stats = (len(st.played), st.legends)
+        self._stats = (len(st.played - st.excluded), st.active)
         self._draw_header()
         self._draw_progress()
         self._draw_recent()
@@ -742,16 +811,31 @@ class App:
         if i is None:
             self.hint.config(text=self._default_hint)
             return
-        state = "played" if i in self.st.played else "unplayed"
-        self.hint.config(text=f"Legend #{i + 1}   ·   {state}   ·   click to toggle")
+        if i in self.st.excluded:
+            self.hint.config(text=f"Legend #{i + 1}   ·   excluded   ·   right-click to include it again")
+        else:
+            state = "played" if i in self.st.played else "unplayed"
+            self.hint.config(text=f"Legend #{i + 1}   ·   {state}   ·   click to toggle   ·   right-click to exclude")
         row, col = divmod(i + 1, self.st.grid["cols"])
         x0, y0 = self.PAD + col * self.CELL, self.PAD + row * self.CELL
         self.gcv.create_rectangle(x0 - 1, y0 - 1, x0 + self.CELL - 2, y0 + self.CELL - 2,
                                   outline=ROSE_D, width=2, tags="hover")
 
-    def _on_click(self, e):
+    def _on_rclick(self, e):
         i = self._legend_at(e)
         if i is not None:
+            self.st.excluded ^= {i}
+            self.st.save()
+            self.refresh()
+
+    def clear_excluded(self):
+        self.st.excluded.clear()
+        self.st.save()
+        self.refresh()
+
+    def _on_click(self, e):
+        i = self._legend_at(e)
+        if i is not None and i not in self.st.excluded:
             self.st.played ^= {i}
             self.st.history = [h for h in self.st.history if h != i]
             if i in self.st.played:
@@ -763,23 +847,193 @@ class App:
     def key(self, act):
         return self.st.hotkeys[act].upper()
 
-    def pick(self):
-        st, note = self.st, ""
+    def _take_news(self):
+        news, self._news = self._news, ""
+        return news
+
+    def pick(self, avoid=None, prefix=""):
+        """F7: read the cursor first (also spots new legends), then draw the next legend."""
+        if self._scanning:
+            return
+        self._skipped = set(avoid or ())
+        if self.st.opts["scan"] and ImageGrab is not None:
+            self.scan_async(lambda cur, _hits: self._choose(cur, prefix))
+        else:
+            self._choose(None, prefix)
+
+    def _choose(self, cur, prefix=""):
+        st = self.st
+        note = prefix + self._take_news()
         pool = st.unplayed()
         if not pool:
+            if st.active == 0:
+                self.ov.show("Every legend is excluded - right-click a tile to include it again")
+                return
             if st.opts["auto_reset"]:
                 st.reset()
-                pool, note = st.unplayed(), "New cycle!  "
+                pool, note = st.unplayed(), note + "New cycle!  "
             else:
                 self.ov.show(f"Everyone's been played - press {self.key('reset')} twice to reset")
                 return
         if not st.history and st.last in pool and len(pool) > 1:
             pool = [x for x in pool if x != st.last]  # never open a new cycle with the legend that closed the last one
+        pool = [x for x in pool if x not in self._skipped] or pool  # skipped legends wait for a later draw
         i = random.SystemRandom().choice(pool)
         st.mark(i)
         st.save()
         self.refresh()
-        self.ov.show(f"{note}Play legend #{i + 1}  ·  {len(st.unplayed())} left", highlight=i)
+        msg = f"{note}Play legend #{i + 1}"
+        if st.opts["scan"]:
+            msg += f"  ·  {self.route_text(cur, i + 1)}" if cur is not None else "  ·  cursor not found"
+        self.ov.show(f"{msg}  ·  {len(st.unplayed())} left", highlight=i, origin=cur)
+
+    def skip(self):
+        """Don't fancy this pick? It goes back to unplayed and a different legend is drawn."""
+        if self._scanning:
+            return
+        if not self.st.history:
+            self.ov.show(f"Nothing to skip yet - press {self.key('pick')} first")
+            return
+        prev = self.st.undo()
+        self.st.save()
+        self.refresh()
+        self.pick(avoid=self._skipped | {prev}, prefix=f"Skipped #{prev + 1}  ·  ")
+
+    def _score_frame(self, img):
+        """Find the blue 'P1' tag in one screenshot. Returns (slot, hits, good, minimum)."""
+        g, o = self.st.grid, self.st.opts
+        sx, sy = img.width / g["base_w"], img.height / g["base_h"]
+        cw = (g["right"] - g["left"]) / g["cols"]
+        ch = (g["bottom"] - g["top"]) / g["rows"]
+        t0, t1, t2 = o["tag_color"]
+        tol = o["tag_tol"]
+        span = max(1, 255 - t0)
+        best, slot = 0, None
+        for n in range(self.st.legends + 1):  # slot 0 = Random tile, slot n = legend n
+            r, c = divmod(n, g["cols"])
+            left, top = g["left"] + c * cw, g["top"] + r * ch
+            box = (max(0, int(left * sx)), max(0, int((top + 20) * sy)),
+                   min(img.width, int((left + 24) * sx)), min(img.height, int((top + 46) * sy)))
+            if box[2] <= box[0] or box[3] <= box[1]:
+                continue
+            data = img.crop(box).tobytes()
+            hits = 0
+            for k in range(0, len(data), 3):
+                pr, pg, pb = data[k], data[k + 1], data[k + 2]
+                if pb < t2 - tol:
+                    continue
+                # f = how far this pixel has faded toward white (0 = full tag colour)
+                f = (pr - t0) / span
+                if not -tol / span <= f <= FADE_MAX:
+                    continue
+                k_ = max(0.0, 1 - max(f, 0.0) / FADE_MAX)  # pale colours must sit close to the fade line
+                if (abs(pg - (t1 + f * (255 - t1))) <= max(15, (tol + 10) * k_)
+                        and abs(pb - (t2 + f * (255 - t2))) <= max(15, tol * k_)):
+                    hits += 1
+            if hits > best:
+                best, slot = hits, n
+        return slot, best, 115 * sx * sy, 100 * sx * sy
+
+    def _legends_on_screen(self, img):
+        """Count filled portrait tiles (empty slots are flat and pale). None = can't tell."""
+        g = self.st.grid
+        m = max(2, int(5 * min(img.width / g["base_w"], img.height / g["base_h"])))
+        cap = g["cols"] * g["rows"] - 1
+
+        def filled(n):  # grid slot n holds legend n-1
+            x0, y0, x1, y1 = self.st.rect(n - 1, img.width, img.height)
+            tile = img.crop((int(x0) + m, int(y0) + m, int(x1) - m, int(y1) - m))
+            return sum(ImageStat.Stat(tile).stddev) / 3 > 32
+
+        if not all(filled(n) for n in range(1, self.st.legends + 1)):
+            return None  # known tiles don't look filled: not the select screen, or covered
+        count = self.st.legends
+        while count < cap and filled(count + 1):
+            count += 1
+        return count
+
+    def scan_async(self, done):
+        """Read-only: grab a few screenshots over ~1.3 s (the tag blinks) in a background
+        thread, keep the best match, then call done(slot, hits) on the UI thread.
+        slot 0 = Random tile, None = not found. Sends no input and never touches the game."""
+        if ImageGrab is None:
+            done(None, 0)
+            return
+        self._scanning = True
+        if self.ov.visible:  # keep our own overlay out of the capture
+            self.ov.win.withdraw()
+
+        def worker():
+            slot, hits, best_img, seen = None, 0, None, None
+            try:
+                time.sleep(0.1)  # let the overlay vanish
+                end = time.monotonic() + SCAN_SECONDS
+                while True:
+                    img = ImageGrab.grab().convert("RGB")
+                    s_, h_, good, minimum = self._score_frame(img)
+                    if h_ > hits:
+                        slot, hits, best_img = s_, h_, img
+                    if hits >= good or time.monotonic() >= end:
+                        break
+                    time.sleep(0.05)
+                if hits < minimum:
+                    slot = None
+                if slot is not None and self.st.opts["auto_legends"]:
+                    seen = self._legends_on_screen(best_img)  # only trusted when the cursor was found
+            except Exception:
+                self._log("Screen capture error")
+                slot = None
+            finally:
+                self.q.put(lambda: self._scan_done(done, slot, hits, seen, best_img))
+
+        threading.Thread(target=worker, name="BrawlhallaPicker-Scan", daemon=True).start()
+
+    def _scan_done(self, done, slot, hits, seen=None, img=None):
+        self._scanning = False
+        if seen and seen > self.st.legends:
+            self._add_legends(seen, img)
+        done(slot, hits)
+
+    def _add_legends(self, count, img):
+        """The select screen shows more portraits than we track: a new legend was released."""
+        old = self.st.legends
+        self.st.grid["legends"] = count
+        self.st.save()
+        if Image is not None and img is not None:
+            for i in range(old, count):
+                try:
+                    self._save_thumb(img, i)
+                except Exception:
+                    self._log("Thumbnail error")
+        added = count - old
+        self._news = (f"New legend #{count} detected  ·  " if added == 1
+                      else f"{added} new legends detected  ·  ")
+        self.gvars["legends"].set(count)  # updates Settings and reloads portraits + grid
+
+    def route_text(self, cur, target):
+        cols = self.st.grid["cols"]
+        (r0, c0), (r1, c1) = divmod(cur, cols), divmod(target, cols)
+        dx, dy = c1 - c0, r1 - r0
+        parts = []
+        if dx:
+            parts.append(f"{abs(dx)} {'→' if dx > 0 else '←'}")
+        if dy:
+            parts.append(f"{abs(dy)} {'↓' if dy > 0 else '↑'}")
+        return "  ".join(parts) or "you're already on it"
+
+    def find_cursor(self):
+        if self._scanning:
+            return
+
+        def done(cur, hits):
+            news = self._take_news()
+            if cur is None:
+                self.ov.show(f"Cursor tag not found (best match {hits} px) - open the legend select screen")
+            else:
+                where = "the Random tile" if cur == 0 else f"legend #{cur}"
+                self.ov.show(f"{news}Your cursor is on {where}", origin=cur)
+
+        self.scan_async(done)
 
     def undo(self):
         if self.st.undo() is not None:
@@ -812,9 +1066,12 @@ class App:
     def _save_opts(self):
         try:
             self.st.opts["auto_hide"] = max(0, int(self.v_hide.get()))
+            self.st.opts["tag_tol"] = max(5, min(80, int(self.v_tol.get())))
         except (tk.TclError, ValueError):
             return
         self.st.opts["auto_reset"] = bool(self.v_auto.get())
+        self.st.opts["scan"] = bool(self.v_scan.get())
+        self.st.opts["auto_legends"] = bool(self.v_newleg.get())
         self.st.save()
 
     def _cal_soon(self):
@@ -831,6 +1088,7 @@ class App:
             return
         g["legends"] = min(g["legends"], g["cols"] * g["rows"] - 1)
         self.st.played = {i for i in self.st.played if i < g["legends"]}
+        self.st.excluded = {i for i in self.st.excluded if i < g["legends"]}
         self.st.save()
         self.load_thumbs()
         self.refresh()
@@ -847,6 +1105,15 @@ class App:
             self.ov.align = True
             self.ov.show("Alignment preview - tune the numbers until the boxes fit")
 
+    def _save_thumb(self, img, i):
+        """Crop legend i's portrait out of a select-screen screenshot and store it."""
+        THUMB_DIR.mkdir(exist_ok=True)
+        x0, y0, x1, y1 = self.st.rect(i, img.width, img.height)
+        tile = img.crop((int(x0) + 2, int(y0) + 2, int(x1) - 2, int(y1) - 2))
+        dst = THUMB_DIR / f"{i + 1:02d}.png"
+        tile.resize((self.CELL - 3, self.CELL - 3), Image.LANCZOS).save(dst)
+        self._make_played(dst, THUMB_DIR / f"{i + 1:02d}_played.png")
+
     def import_thumbs(self):
         if Image is None:
             messagebox.showinfo("Pillow needed", "Run:  pip install pillow\nthen try again.")
@@ -857,14 +1124,8 @@ class App:
         if not path:
             return
         img = Image.open(path).convert("RGB")
-        THUMB_DIR.mkdir(exist_ok=True)
-        size = self.CELL - 3
         for i in range(self.st.legends):
-            x0, y0, x1, y1 = self.st.rect(i, img.width, img.height)
-            tile = img.crop((int(x0) + 2, int(y0) + 2, int(x1) - 2, int(y1) - 2))
-            dst = THUMB_DIR / f"{i + 1:02d}.png"
-            tile.resize((size, size), Image.LANCZOS).save(dst)
-            self._make_played(dst, THUMB_DIR / f"{i + 1:02d}_played.png")
+            self._save_thumb(img, i)
         self.load_thumbs()
         self.refresh()
         messagebox.showinfo("Done", "Portraits imported. If they look misaligned, "
@@ -930,9 +1191,20 @@ class App:
             opts.update({k: opts_data[k] for k in DEFAULT_OPTS if k in opts_data})
             opts["auto_hide"] = max(0, min(60, int(opts["auto_hide"])))
             opts["auto_reset"] = bool(opts["auto_reset"])
+            opts["scan"] = bool(opts["scan"])
+            opts["auto_legends"] = bool(opts["auto_legends"])
+            opts["tag_tol"] = max(5, min(80, int(opts["tag_tol"])))
+            tc = opts["tag_color"]
+            opts["tag_color"] = ([max(0, min(255, int(x))) for x in tc]
+                                 if isinstance(tc, list) and len(tc) == 3
+                                 else list(DEFAULT_OPTS["tag_color"]))
 
             played = {int(i) for i in played_data if 0 <= int(i) < grid["legends"]}
             history = [int(i) for i in history_data if 0 <= int(i) < grid["legends"] and int(i) in played]
+            excluded_data = data.get("excluded", [])
+            if not isinstance(excluded_data, list):
+                raise ValueError("Excluded list has an invalid format.")
+            excluded = {int(i) for i in excluded_data if 0 <= int(i) < grid["legends"]}
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             messagebox.showerror("Import failed", f"This backup could not be loaded:\n{exc}")
             return
@@ -944,12 +1216,15 @@ class App:
             self.st.save()
             shutil.copy2(DATA_FILE, DATA_FILE.with_name("brawl_state_before_import.json"))
             self.st.grid, self.st.hotkeys, self.st.opts = grid, hotkeys, opts
-            self.st.played, self.st.history = played, history
+            self.st.played, self.st.history, self.st.excluded = played, history, excluded
             self.st.save()
             for key, var in self.gvars.items():
                 var.set(self.st.grid[key])
             self.v_hide.set(self.st.opts["auto_hide"])
             self.v_auto.set(self.st.opts["auto_reset"])
+            self.v_scan.set(self.st.opts["scan"])
+            self.v_newleg.set(self.st.opts["auto_legends"])
+            self.v_tol.set(self.st.opts["tag_tol"])
             self.refresh_hotkey_labels()
             self.bind_hotkeys(show_errors=True)
             self.load_thumbs()
@@ -966,7 +1241,8 @@ class App:
 
     def bind_hotkeys(self, show_errors=False):
         actions = {"show": lambda: self.ov.show(), "pick": self.pick, "hide": self.ov.hide,
-                   "undo": self.undo, "reset": self.hotkey_reset}
+                   "undo": self.undo, "reset": self.hotkey_reset, "scan": self.find_cursor,
+                   "skip": self.skip}
         errors = self.hotkeys.start(
             self.st.hotkeys,
             lambda action: self.q.put(actions[action]) if not self._closing else None)
